@@ -1,0 +1,2381 @@
+---
+title: "Q1 - Homework 2- ML for finance"
+author: "Filippo Fortugno and Lucas Santos"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r packages}
+#### Cleaning the environment
+rm(list = ls())
+
+setwd("../Homework_2/dataSent")
+
+#### installing the packages and importing data
+pacman::p_load("xts", "zoo", "quantmod", "PerformanceAnalytics", "matrixStats",
+               "doParallel", "dplyr", "readr", "lubridate", "ggplot2", "reshape2",
+               "e1071", "nnet", "neuralnet", "kernlab", "quantmod", "Metrics", "xtable")
+
+
+HSBC <- read.csv('HSBC.csv', sep = ",", header = TRUE)
+MSFT <- read.csv('MSFT.csv', sep = ",", header = TRUE)
+
+```
+
+# Question 1
+
+```{r}
+
+#### defining the functions ####
+
+### Function defined by professor to calculate the performance
+
+Performance <- function(x,ntrades=1,cost=0) {
+  cumRetx = Return.cumulative(x,geometric = TRUE) -ntrades*cost
+  #annRetx = Return.annualized(x, scale=252,geometric = T) -ntrades*cost
+  annRetx = (cumRetx +1)^{252/length(x)} -1
+  #sharpex = SharpeRatio.annualized(x, scale=252)
+  sharpex = annRetx/sd.annualized(x,scale=252)
+  winpctx = length(x[x > 0])/length(x[x != 0])
+  annSDx = sd.annualized(x, scale=252)
+  DDs <- findDrawdowns(x)
+  maxDDx = min(DDs$return)
+  maxLx = max(DDs$length)
+  
+  Perf = c(cumRetx, annRetx, sharpex, winpctx, annSDx, maxDDx, maxLx, ntrades)
+  names(Perf) = c("Cumulative Return", "Annual Return","Annualized Sharpe Ratio","Win %", 
+                  "Annualized Volatility", "Maximum Drawdown", "Max Length Drawdown","n.trades")
+  return(Perf)
+}
+
+
+##Test MA crossover Strategy.
+##inputs: stock price history, ts=ev (explanatory variable for signallig trade, if none given use the stok),
+# parameters of MA strategy: s>m,longshort= 0 (long-only), -1 (long and short)
+# consider number of trades to compute transaction costs (runs of signal vector. funct rle)
+# consider basic constant tcost=transaction cost per share (regardless of price)
+# the simulations are for 1 unit of share, so tcost=0.01 .. 0.05
+testMAStrategy <- function(myStock,ts =myStock,s=5, m=20,longshort=0,tcost=0) {
+  ##Create signal: for s<m, MA(s)>MA(m) long (1), else short (-1) (if no shorting allow use 0 instead of -1)
+  # Lag so yesterday's signal is applied to today's returns
+  myPosition <- sig <- Lag(ifelse(SMA(ts,s)>SMA(ts,m), 1, longshort),1)
+  runs<-rle(as.vector(na.omit(sig)))
+  lruns <- length(runs$lengths)
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns*sig
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'MAx'
+  tt <- na.omit(merge(bmkReturns,myReturns))
+  ##Performance
+  #charts.PerformanceSummary(cbind(tt$MAx,tt$BH), main=paste(names(ts),".on.",names(myStock)," MAcrossover",sep=""))
+  cbind(MAx=Performance(tt$MAx,lruns,tcost),BH=Performance(tt$BH,2,tcost))
+}
+
+
+##Average Performance of MA crossover over short (1 yr, 6 mon) fixed length periods
+##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+## step-size fixed to 1 day (ToDo: make stepsize variable; include transaction costs)
+RollingTestMAStrategy <- function(myStock,ts =myStock,s=5, m=20,longshort=0,w_size=252) {
+  myPosition <- sig <- Lag(ifelse(SMA(ts,s)>SMA(ts,m), 1, longshort),1)
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns*sig
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'Me'  ## paste(names(ts),".on.",names(myStock),sep="")
+  tt <- na.omit(merge(bmkReturns,myReturns))
+  n_windows = nrow(tt) - w_size
+  if(n_windows<1) stop("Window size too large")
+  
+  perform = foreach(i=1:n_windows, .combine = rbind) %do%{
+    bhStra = tt$BH[i:(w_size+i-1),]
+    myStra = tt$Me[i:(w_size+i-1),]
+    per=rbind(BH=Performance(bhStra),Me=Performance(myStra))
+    return(per)
+  }
+  
+  bhindx = seq(1,2*n_windows,2); meindx = seq(2,2*n_windows,2)
+  BHmeans = colMeans2(perform,rows = bhindx)
+  MEmeans = colMeans2(perform,rows = meindx)
+  MeanPerf=rbind(BHmeans,MEmeans)
+  colnames(MeanPerf)=colnames(perform)
+  rownames(MeanPerf)=c("BH","Me")
+  return(list("AvgPerf"=MeanPerf,"NumWindows"=n_windows))
+}
+
+### Functions we built
+
+
+testMACDStrategy <- function(myStock, ts = myStock, short_period = 12, long_period = 26, signal_period = 9, longshort = 0, tcost = 0) {
+  
+  # Calculate MACD
+  macd <- MACD(ts, nFast = short_period, nSlow = long_period, nSig = signal_period)
+  macd_line <- macd$macd
+  signal_line <- macd$signal
+  
+  # Create signal: MACD strategy
+  macd_signal <- Lag(ifelse(macd_line > signal_line, 1, longshort), 1)
+  macd_runs <- rle(as.vector(na.omit(macd_signal)))
+  macd_lruns <- length(macd_runs$lengths)
+  
+  # Calculate returns
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  macd_returns <- bmkReturns * macd_signal
+  
+  # Set column names
+  names(bmkReturns) <- 'BH'
+  names(macd_returns) <- 'MACD'
+  
+  # Merge returns and calculate performance
+  tt <- na.omit(merge(bmkReturns, macd_returns))
+  performance_macd <- Performance(tt$MACD, macd_lruns, tcost)
+  
+  # Return performance results
+  result <- cbind(performance_macd, BH = Performance(tt$BH, 2, tcost))
+  return(result)
+}
+
+testTMAStrategy <- function(myStock, ts = myStock, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = 0, tcost = 0) {
+  
+  # Calculate TMA
+  tma_short <- SMA(ts, n = tma_short_period)
+  tma_medium <- SMA(ts, n = tma_medium_period)
+  tma_long <- SMA(ts, n = tma_long_period)
+  
+  # Create signal: TMA strategy
+  tma_signal <- Lag(ifelse(tma_short > tma_medium & tma_medium > tma_long, 1, longshort), 1)
+  tma_runs <- rle(as.vector(na.omit(tma_signal)))
+  tma_lruns <- length(tma_runs$lengths)
+  
+  # Calculate returns
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  tma_returns <- bmkReturns * tma_signal
+  
+  # Set column names
+  names(bmkReturns) <- 'BH'
+  names(tma_returns) <- 'TMA'
+  
+  # Merge returns and calculate performance
+  tt <- na.omit(merge(bmkReturns, tma_returns))
+  performance_tma <- Performance(tt$TMA, tma_lruns, tcost)
+  
+  # Return performance results
+  result <- cbind(performance_tma, BH = Performance(tt$BH, 2, tcost))
+  return(result)
+}
+
+fillNAsForward <- function(x) {
+  if (is.xts(x)) {
+    na.locf(x, na.rm = FALSE)
+  } else {
+    stop("Input must be an xts object.")
+  }
+}
+
+
+RollingTestMACDStrategy <- function(myStock, ts = myStock, short_period = 12, long_period = 26, signal_period = 9, longshort = 0, w_size = 252) {
+  macd <- MACD(ts, nFast = short_period, nSlow = long_period, nSig = signal_period)
+  macd_line <- macd$macd
+  signal_line <- macd$signal
+  
+  myPosition <- sig <- Lag(ifelse(macd_line > signal_line, 1, longshort), 1)
+  
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns * sig
+  
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'MACD'
+  
+  tt <- na.omit(merge(bmkReturns, myReturns))
+  
+  n_windows <- nrow(tt) - w_size
+  if (n_windows < 1) stop("Window size too large")
+  
+  perform <- foreach(i = 1:n_windows, .combine = rbind) %do% {
+    bhStra <- tt$BH[i:(w_size + i - 1), ]
+    myStra <- tt$MACD[i:(w_size + i - 1), ]
+    per <- rbind(BH = Performance(bhStra), MACD = Performance(myStra))
+    return(per)
+  }
+  
+  bhindx <- seq(1, 2 * n_windows, 2)
+  meindx <- seq(2, 2 * n_windows, 2)
+  BHmeans <- colMeans2(perform, rows = bhindx)
+  MACDmeans <- colMeans2(perform, rows = meindx)
+  MeanPerf <- rbind(BHmeans, MACDmeans)
+  colnames(MeanPerf) <- colnames(perform)
+  rownames(MeanPerf) <- c("BH", "MACD")
+  
+  return(list("AvgPerf" = MeanPerf, "NumWindows" = n_windows))
+}
+
+RollingTestTMAStrategy <- function(myStock, ts = myStock, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = 0, w_size = 252) {
+  tma_short <- SMA(ts, n = tma_short_period)
+  tma_medium <- SMA(ts, n = tma_medium_period)
+  tma_long <- SMA(ts, n = tma_long_period)
+  
+  myPosition <- sig <- Lag(ifelse(tma_short > tma_medium & tma_medium > tma_long, 1, longshort), 1)
+  
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns * sig
+  
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'TMA'
+  
+  tt <- na.omit(merge(bmkReturns, myReturns))
+  
+  n_windows <- nrow(tt) - w_size
+  if (n_windows < 1) stop("Window size too large")
+  
+  perform <- foreach(i = 1:n_windows, .combine = rbind) %do% {
+    bhStra <- tt$BH[i:(w_size + i - 1), ]
+    myStra <- tt$TMA[i:(w_size + i - 1), ]
+    per <- rbind(BH = Performance(bhStra), TMA = Performance(myStra))
+    return(per)
+  }
+  
+  bhindx <- seq(1, 2 * n_windows, 2)
+  meindx <- seq(2, 2 * n_windows, 2)
+  BHmeans <- colMeans2(perform, rows = bhindx)
+  TMAmeans <- colMeans2(perform, rows = meindx)
+  MeanPerf <- rbind(BHmeans, TMAmeans)
+  colnames(MeanPerf) <- colnames(perform)
+  rownames(MeanPerf) <- c("BH", "TMA")
+  
+  return(list("AvgPerf" = MeanPerf, "NumWindows" = n_windows))
+}
+
+
+
+```
+
+
+#### Correlation plot
+
+```{r, echo=FALSE, warning=FALSE}
+
+
+folder_path <- '../Homework_2/dataSent/'
+files <- list.files(folder_path, pattern = '\\.csv$', full.names = TRUE)
+
+dfs <- list()  # List to store individual dataframes
+
+for (file in files) {
+  df <- read_csv(file)
+  
+  # Extract the filename without extension
+  column_name <- tools::file_path_sans_ext(basename(file))
+  
+  # Perform transformations
+  df <- df[, -1]
+  colnames(df)[-1] <- c('Date', column_name)
+  df$Date <- ymd(df$Date)
+  
+  # Check number of rows
+  if (nrow(df) == 602) {
+    # Append dataframe to the list
+    dfs[[column_name]] <- df[column_name]
+  }
+}
+
+# Concatenate all dataframes into a single dataframe
+df <- do.call(cbind, dfs)
+
+```
+
+```{r}
+# Check for missing values
+print(any(is.na(df))) # no missing values
+
+
+cormat <- round(cor(df),2)
+melted_cormat <- melt(cormat)
+
+# Get lower triangle of the correlation matrix
+  get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+  get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+reorder_cormat <- function(cormat){
+# Use correlation between variables as distance
+dd <- as.dist((1-cormat)/2)
+hc <- hclust(dd)
+cormat <-cormat[hc$order, hc$order]
+}
+
+# Reorder the correlation matrix
+cormat <- reorder_cormat(cormat)
+upper_tri <- get_upper_tri(cormat)
+# Melt the correlation matrix
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+# Create a ggheatmap
+ggheatmap <- ggplot(melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+
+
+ggheatmap + 
+geom_text(aes(Var2, Var1, label = value), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = c(0.6, 0.7),
+  legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "top", title.hjust = 0.5))
+
+```
+
+### Pre-processing
+
+
+```{r}
+#### Pre-Processing ####
+
+# Initial Plots
+
+
+
+# Checking for NAs
+
+na_cols <- colMeans(is.na(HSBC)) *100
+non_na_cols <- 100 - na_cols
+
+non_NA_plot <- barplot(sort(non_na_cols, decreasing = TRUE),
+                       ylim = c(0, 100),
+                       main = "% of complete data (HSBC)",
+                       las = 2,
+                       col = 'lightblue'
+)
+box()
+grid()
+
+
+na_cols <- colMeans(is.na(MSFT)) *100
+non_na_cols <- 100 - na_cols
+
+non_NA_plot <- barplot(sort(non_na_cols, decreasing = TRUE),
+                       ylim = c(0, 100),
+                       main = "% of complete data (MSFT)",
+                       las = 2,
+                       col = 'lightblue'
+)
+box()
+grid()
+
+```
+
+
+## Analysis
+
+
+```{r}
+# Load and set up data
+
+  HSBC<-HSBC[,-1]
+  
+  MSFT<-MSFT[,-1]
+
+  HSBC <- as.xts(zoo(as.matrix(HSBC[,-1]), as.Date(as.character(HSBC[,1]))))
+  HSBC <- as.xts(apply(HSBC, 2, as.numeric), order.by = index(HSBC))
+  MSFT <- as.xts(zoo(as.matrix(MSFT[,-1]), as.Date(as.character(MSFT[,1]))))
+  MSFT <- as.xts(apply(MSFT, 2, as.numeric), order.by = index(MSFT))
+```
+
+
+```{r}
+  
+  
+  # Define targets
+  target_HSBC <- HSBC$Adj.Close
+  names(target_HSBC) <- "HSBC"
+  
+  target_MSFT <- MSFT$Adj.Close
+  names(target_MSFT) <- "MSFT"
+  
+  # Creating the indicators
+  # Bearish sentiment indicators
+  neg_HSBC <-  HSBC$negativePartscr
+  names(neg_HSBC)<- "negative HSBC"
+  unc_HSBC <-  HSBC$uncertaintyPartscr
+  names(unc_HSBC)<- "unvertainty HSBC"
+  find_HSBC <-  HSBC$findownPartscr
+  names(find_HSBC)<- "financial downrisk HSBC"
+  
+  neg_MSFT <- MSFT$negativePartscr
+  names(neg_MSFT)<- "negative MSFT"
+  unc_MSFT <-  MSFT$uncertaintyPartscr
+  names(unc_MSFT)<- "unvertainty MSFT"
+  find_MSFT <-  MSFT$findownPartscr
+  names(find_MSFT)<- "financial downrisk MSFT"
+  
+  # Bullish sentiment indicators
+  pos_HSBC <- HSBC$positivePartscr
+  names(pos_HSBC) <- "positive HSBC"
+  cert_HSBC <- HSBC$certaintyPartscr
+  names(cert_HSBC)<- "certainty HSBC"
+  finu_HSBC <- HSBC$finupPartscr
+  names(finu_HSBC)<- "financial uprisk HSBC"
+  
+  pos_MSFT <- MSFT$positivePartscr
+  names(pos_MSFT) <- "positive MSFT"
+  cert_MSFT <- MSFT$certaintyPartscr
+  names(cert_MSFT)<- "certainty MSFT"
+  finu_MSFT <- MSFT$finupPartscr
+  names(finu_MSFT)<- "financial uprisk MSFT"
+  
+  # Combinations
+  BULL_HSBC <- .33*(pos_HSBC + cert_HSBC + finu_HSBC)
+  BEAR_HSBC <- .33*(neg_HSBC + unc_HSBC + find_HSBC); 
+  names(BULL_HSBC)<-"BULL_HSBC"; 
+  names(BEAR_HSBC)<-"BEAR_HSBC"
+  
+  BULL_MSFT <- .33*(pos_MSFT + cert_MSFT + finu_MSFT); 
+  BEAR_MSFT <- .33*(neg_MSFT + unc_MSFT + find_MSFT); 
+  names(BULL_MSFT)<-"BULL_MSFT"; 
+  names(BEAR_MSFT)<-"BEAR_MSFT"
+  
+  BBr_HSBC <- 100*BULL_HSBC/(BULL_HSBC+BEAR_HSBC)
+  names(BBr_HSBC)<-"BBr HSBC"
+  BBr_MSFT <- 100*BULL_MSFT/(BULL_MSFT+BEAR_MSFT)
+  names(BBr_MSFT)<-"BBr MSFT"
+  
+  PNr_HSBC <- 100*pos_HSBC/(pos_HSBC+neg_HSBC)
+  names(PNr_HSBC)<-"PNr HSBC"
+  PNr_MSFT <- 100*pos_MSFT/(pos_MSFT+neg_MSFT)
+  names(PNr_HSBC)<-"PNr HSBC"
+  
+  PNlog_HSBC <- 0.5*log((pos_HSBC + 1)/(neg_HSBC + 1))
+  names(PNlog_HSBC)<-"PNr_HSBC"
+  PNlog_MSFT <- 0.5*log((pos_MSFT + 1)/(neg_MSFT + 1))
+  names(PNlog_MSFT)<-"PNr_MSFT"
+  
+
+```
+
+```{r}
+# filling NAs
+
+BULL_HSBC <- fillNAsForward(BULL_HSBC)
+BEAR_HSBC <- fillNAsForward(BEAR_HSBC)
+BBr_HSBC <- fillNAsForward(BBr_HSBC)
+PNr_HSBC <- fillNAsForward(PNr_HSBC)
+PNlog_HSBC <- fillNAsForward(PNlog_HSBC)
+
+BULL_MSFT <- fillNAsForward(BULL_MSFT)
+BEAR_MSFT <- fillNAsForward(BEAR_MSFT)
+BBr_MSFT <- fillNAsForward(BBr_MSFT)
+PNr_MSFT <- fillNAsForward(PNr_MSFT)
+PNlog_MSFT <- fillNAsForward(PNlog_MSFT)
+```
+
+
+## Normal strategy just reporting some results
+
+
+### HSBC
+#### MACD
+```{r}
+
+
+###### With BULL
+
+
+# no long short
+target <- target_HSBC
+ev <- BULL_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_1 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_1
+
+
+# long and short
+ls <- -1
+
+HSBC_2 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_2
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_3 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_3
+
+
+
+##### With BEAR
+
+# no long short
+target <- target_HSBC
+ev <- BEAR_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_4 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_4
+
+
+# long and short
+ls <- -1
+
+HSBC_5 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_5
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_6 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_6
+
+
+
+
+##### With BBr
+# no long short
+target <- target_HSBC
+ev <- BBr_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_7 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_7
+
+
+# long and short
+ls <- -1
+
+HSBC_8 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_8
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_9 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_9
+
+##### With BBr
+# no long short
+target <- target_HSBC
+ev <- PNlog_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_10 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_10
+
+
+# long and short
+ls <- -1
+
+HSBC_11 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_11
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_12 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+HSBC_12
+
+
+
+
+```
+
+```{r}
+
+HSBC_Bull_table <- xtable(HSBC_2)
+HSBC_BBr_table <- xtable(HSBC_8)
+print(HSBC_Bull_table)
+print("---------- other table ----------")
+print(HSBC_BBr_table)
+
+```
+
+
+#### TMA
+
+```{r}
+###### With BULL
+
+
+# no long short
+target <- target_HSBC
+ev <- BULL_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_1 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_1
+
+
+# long and short
+ls <- -1
+
+HSBC_2 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_2
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_3 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_3
+
+
+
+##### With BEAR
+
+# no long short
+target <- target_HSBC
+ev <- BEAR_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_4 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_4
+
+
+# long and short
+ls <- -1
+
+HSBC_5 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_5
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_6 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_6
+
+
+
+
+##### With BBr
+# no long short
+target <- target_HSBC
+ev <- BBr_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_7 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_7
+
+
+# long and short
+ls <- -1
+
+HSBC_8 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_8
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_9 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_9
+
+##### With BBr
+# no long short
+target <- target_HSBC
+ev <- PNlog_HSBC
+cost <- 0 
+ls <- 0
+
+HSBC_10 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_10
+
+
+# long and short
+ls <- -1
+
+HSBC_11 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_11
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+HSBC_12 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+HSBC_12
+
+
+
+
+```
+
+```{r}
+HSBC_Bear_table <- xtable(HSBC_5)
+HSBC_BBr_table <- xtable(HSBC_8)
+print(HSBC_Bear_table)
+print("---------- other table ----------")
+print(HSBC_BBr_table)
+```
+
+
+
+
+
+### MSFT
+
+#### MACD
+```{r}
+
+
+###### With BULL
+
+
+# no long short
+target <- target_MSFT
+ev <- BULL_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_1 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_1
+
+
+# long and short
+ls <- -1
+
+MSFT_2 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_2
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_3 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_3
+
+
+
+##### With BEAR
+
+# no long short
+target <- target_MSFT
+ev <- BEAR_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_4 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_4
+
+
+# long and short
+ls <- -1
+
+MSFT_5 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_5
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_6 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_6
+
+
+
+
+##### With BBr
+# no long short
+target <- target_MSFT
+ev <- BBr_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_7 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_7
+
+
+# long and short
+ls <- -1
+
+MSFT_8 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_8
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_9 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_9
+
+##### With BBr
+# no long short
+target <- target_MSFT
+ev <- PNlog_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_10 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_10
+
+
+# long and short
+ls <- -1
+
+MSFT_11 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_11
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_12 <- testMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, tcost = cost)
+MSFT_12
+
+
+
+
+```
+
+```{r}
+
+MSFT_Bull_table <- xtable(MSFT_1)
+MSFT_BBr_table <- xtable(MSFT_4)
+print(MSFT_Bull_table)
+print("---------- other table ----------")
+print(MSFT_BBr_table)
+
+```
+
+
+#### TMA
+
+```{r}
+###### With BULL
+
+
+# no long short
+target <- target_MSFT
+ev <- BULL_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_1 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_1
+
+
+# long and short
+ls <- -1
+
+MSFT_2 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_2
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_3 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_3
+
+
+
+##### With BEAR
+
+# no long short
+target <- target_MSFT
+ev <- BEAR_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_4 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_4
+
+
+# long and short
+ls <- -1
+
+MSFT_5 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_5
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_6 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_6
+
+
+
+
+##### With BBr
+# no long short
+target <- target_MSFT
+ev <- BBr_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_7 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_7
+
+
+# long and short
+ls <- -1
+
+MSFT_8 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_8
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_9 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_9
+
+##### With BBr
+# no long short
+target <- target_MSFT
+ev <- PNlog_MSFT
+cost <- 0 
+ls <- 0
+
+MSFT_10 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_10
+
+
+# long and short
+ls <- -1
+
+MSFT_11 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_11
+
+# adding trading cost
+
+# long and short
+cost <- 0.005 
+ls <- -1
+
+MSFT_12 <- testTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, tcost = cost)
+MSFT_12
+
+
+
+
+```
+
+```{r}
+MSFT_Bear_table <- xtable(MSFT_4)
+MSFT_BBr_table <- xtable(MSFT_7)
+print(MSFT_Bear_table)
+print("---------- other table ----------")
+print(MSFT_BBr_table)
+```
+
+
+
+
+
+
+
+
+
+## Rolling window
+
+```{r}
+# for HSBC
+target <- target_HSBC
+ev <- BBr_HSBC
+
+ls <- -1
+
+HSBC_rolling_MACD <- RollingTestMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, w_size = 252)
+HSBC_rolling_MACD
+
+
+HSBC_rolling_TMA <- RollingTestTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, w_size = 252)
+
+HSBC_rolling_TMA
+
+```
+
+```{r}
+
+HSBC_rolling_table_MACD <- xtable(HSBC_rolling_MACD$AvgPerf)
+print(HSBC_rolling_table_MACD)
+
+HSBC_rolling_table_TMA <- xtable(HSBC_rolling_TMA$AvgPerf)
+print(HSBC_rolling_table_TMA)
+
+```
+
+
+```{r}
+
+# for MSFT
+target <- target_MSFT
+ev <- BEAR_MSFT
+
+ls <- 0
+
+MSFT_rolling_MACD <- RollingTestMACDStrategy(target, ts = ev, short_period = 12, long_period = 26, signal_period = 9, longshort = ls, w_size = 252)
+MSFT_rolling_MACD
+
+
+MSFT_rolling_TMA <- RollingTestTMAStrategy(target, ts = ev, tma_short_period = 5, tma_medium_period = 20, tma_long_period = 50, longshort = ls, w_size = 252)
+
+MSFT_rolling_TMA
+
+```
+
+
+```{r}
+
+MSFT_rolling_table_MACD <- xtable(MSFT_rolling_MACD$AvgPerf)
+print(MSFT_rolling_table_MACD)
+
+MSFT_rolling_table_TMA <- xtable(MSFT_rolling_TMA$AvgPerf)
+print(MSFT_rolling_table_TMA)
+
+```
+
+
+## EXTRA - Power of explanatory variables  
+
+#### For HSBC
+```{r, bearish variables HSBC}
+
+
+x <- read.csv('../homework_2/dataSent/HSBC.csv', sep = ",", header = TRUE)
+x<-x[,-1]
+##use Date as index
+data <- as.xts(zoo(as.matrix(x[,-1]), as.Date(as.character(x[,1]))))
+
+## Target :  Adj.Close Price 
+target <- data$Adj.Close
+
+
+## Analyse separately two different epochs
+epoc1<-'2018-01/2019-03'
+epoc2<-'2019-04/2020-05'
+epocs <- c(epoc1, epoc2)
+
+##List of tables for storing results
+table <- array(0, dim=c(2,3))
+rownames(table) <- c("epoc1", "epoc2")
+colnames(table) <- cbind("NNET", "SVM", "GP")
+
+
+
+
+# Define bearish set
+negativeP= na.omit(data$negativePartscr)
+uncertaintyP= na.omit(data$uncertaintyPartscr)
+findownP= na.omit(data$findownPartscr)
+
+bearish <- merge(na.trim(lag(negativeP,1)),na.trim(lag(negativeP,2)),na.trim(lag(negativeP,3)),
+                 na.trim(lag(uncertaintyP,1)),na.trim(lag(uncertaintyP,2)),na.trim(lag(uncertaintyP,3)),
+                 na.trim(lag(findownP,1)),na.trim(lag(findownP,2)),na.trim(lag(findownP,3)),
+                 all=FALSE)
+bearnames <- c("NegP.1","NegP.2","NegP.3",
+               "uncerP.1","uncerP.2","uncerP.3",
+               "findP.1","findP.2","findP.3")
+
+
+#Features: lags 1,2,3 of target with lags 1,2,3 of sentiments
+feat = merge(na.trim(lag(target,1)),na.trim(lag(target,2)),na.trim(lag(target,3)),
+            bearish,
+             #add other features here,
+            all=FALSE)
+
+datasetALL = merge(target,feat,all=FALSE)
+colnames(datasetALL) = c("TARGET",
+                         "lag.1", "lag.2", "lag.3",
+                         bearnames
+                         #names of other features
+                         )
+
+
+##Run Forecasting Backtesting
+resultstable <- list("nrmse"= table)
+
+## ANALYSIS  by epochs (1,2)
+## TO DO: parallelise 
+for(i in 1:length(epocs)){
+  dataset<-datasetALL[epocs[i]] 
+  
+  ## Divide data into training (75%) and testing (25%). 
+  T<-nrow(dataset)
+  p=0.75
+  T_trn <- round(p*T)
+  trainindex <- 1:T_trn
+  ## Process class sets as data frames and scale the data 
+  # training = as.data.frame(dataset[trainindex,])
+  # testing = as.data.frame(dataset[-trainindex,])
+  
+  ## Exercise: Sometimes is necessary to scale data (substract mean, divide by std). 
+  ## Caveat: if want to get/plot actual predictions need to recover original scale 
+  ## re-do without scaling and observe if differences in results
+  training =  scale(as.data.frame(dataset[trainindex,]))
+  testing = scale(as.data.frame(dataset[-trainindex,]))
+  
+  rownames(training) = NULL
+  rownames(testing) = NULL
+  set.seed(.Random.seed)
+  
+  ################################
+  ##Fiting SVM, NNet and GP (To DO: tune parameters)
+  #---------------------------------------------------------------------------------------------#
+  #  SUPPORT VECTOR MACHINE --------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  ##svmTune (ToDO)
+  
+  svmFit <- svm(x=training[,-1],
+                  y=training[,1],
+                  type="eps-regression",
+                  kernel="radial",
+                  gamma=1e-03,
+                  cost=100
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  NEURAL NETWORK ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  # C = seq(0.2,1.8,0.2)
+  # size_vals=ceiling(ncol(training)*C)
+  # decay_vals=seq(0.1,1,0.1)
+  # nnetTune 
+  
+  nnetFit <- nnet(x=training[,-1],
+                    y=training[,1],
+                    skip=FALSE,
+                    maxit=10^4,
+                    trace=FALSE,
+                    linout=TRUE,
+                    size=16,
+                    decay=0.2
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  GAUSSIAN PROCESS ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  gpfit = gausspr(training[,-1], y=training[,1],
+                    type="regression",
+                    kernel="laplacedot",
+                    #kpar = list(sigma = 1.5), #list of kernel hyper-parameters 
+                    ## if you make it constant value then does not make mle estimation of sigma
+                    var = 0.002 # the initial noise variance: 0.001 default
+                    )
+  
+  #---------------------------------------------------------------------------------------------#
+  # PREDICTION ---------------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  predsvm  <- as.vector(predict(svmFit, testing[,-1]))
+  prednet <- as.vector(predict(nnetFit, testing[,-1], type="raw"))
+  predgp <- as.vector(predict(gpfit, testing[,-1]))
+  
+  actual <- testing[,1]
+  
+  ##predsvm = as.vector(predict(svmFit, testing[,-1],interval="prediction")) ##prediction interval does not seem to work on svm
+  ##prednet = as.vector(predict(nnetFit,testing[,-1],type="raw",interval="confidence")) ##"confidence" does not seem to work on nnet
+  #####################################
+  ##measure error prediction for all models
+  MSE.nn <- sum((prednet -actual)^2)/nrow(testing)
+  MSE.svm <- sum((predsvm-actual)^2)/nrow(testing)
+  MSE.gp <- sum((predgp -actual)^2)/nrow(testing)
+  
+  ###FURTHER EVALUATION
+  ##1. Evaluation for TARGET prediction. Residual sum of squares
+  ssr.nn=sum((prednet - actual)^2)
+  ssr.svm = sum((predsvm - actual)^2)
+  ssr.gp = sum((predgp - actual)^2)
+  ##Normalize Residual Mean Square Error (NRMSE) = ratio of performance against sample mean
+  ##if < 1 methods outperforms sample mean, ow forget it
+  nrmse.nn = sqrt(ssr.nn/((length(actual)-1)*var(actual)))
+  nrmse.svm = sqrt(ssr.svm/((length(actual)-1)*var(actual)))
+  nrmse.gp = sqrt(ssr.gp/((length(actual)-1)*var(actual)))
+  ##percentage of outperforming direct sample mean (sample expected value)
+  
+  resultstable$nrmse[i,] <- cbind(round(nrmse.nn,3), round(nrmse.svm,3),round(nrmse.gp,3))
+  
+} ##end-for
+
+##Print results of all epochs for bearish features
+bearishtable_HSBC <-resultstable
+
+##Plot predictions (of last epoch) against actual values
+##WARNING: If you've scaled data you must recover back original series
+attributes(testing)
+##recover the scale (sca) factor and center (cen) for targets
+sca <- attr(testing,'scaled:scale')["TARGET"]
+cen <- attr(testing,'scaled:center')["TARGET"]
+
+# par( mfrow = c( 1, 2 ) ) #this to put in different adjacent boxes
+# par(mar=c(2.5,2.5,2.5,2.5)) 
+plot(actual*sca+cen,t='l',col='gray20', ylab='', xlab ='',lty=3, main='Lags $ Bearish - epoch 1 (for HSBC)', cex.main=0.75)
+lines(predsvm*sca+cen,t='l',col='blue',lwd=2)
+lines(prednet*sca+cen,col='tomato',lwd=2)
+lines(predgp*sca+cen,col='green',lwd=2)
+legend('bottomright',legend = c('target','SVM','NNet','GP'),col=c('gray20','blue','tomato','green'),lty=c(3,1,1,1),cex=.7)
+
+
+
+
+```
+
+
+```{r, bullish variables HSBC}
+## Bullish variables
+
+
+positiveP= na.omit(data$positivePartscr)
+certaintyP= na.omit(data$certaintyPartscr)
+finupP= na.omit(data$finupPartscr)
+
+bullish <- merge(na.trim(lag(positiveP,1)),na.trim(lag(positiveP,2)),na.trim(lag(positiveP,3)),
+                 na.trim(lag(certaintyP,1)),na.trim(lag(certaintyP,2)),na.trim(lag(certaintyP,3)),
+                 na.trim(lag(finupP,1)),na.trim(lag(finupP,2)),na.trim(lag(finupP,3)),
+                 all=FALSE)
+bullishnames <- c("PosP.1","PosP.2","PosP.3",
+                  "cerP.1","cerP.2","cerP.3",
+                  "findPp.1","findPp.2","findPp.3")
+
+# Add lags of target and target itself
+
+feat = merge(na.trim(lag(target,1)),na.trim(lag(target,2)),na.trim(lag(target,3)),
+             bullish,
+             #bullishP,
+             #add other features here,
+             all=FALSE)
+
+datasetALL = merge(target,feat,all=FALSE)
+colnames(datasetALL) = c("TARGET",
+                         "lag.1", "lag.2", "lag.3",
+                         bullishnames
+                         #names of other features
+                          )
+
+##Run Forecasting Backtesting (Go to line 109)
+
+##Run Forecasting Backtesting
+resultstable <- list("nrmse"= table)
+
+## ANALYSIS  by epochs (1,2)
+## TO DO: parallelise 
+for(i in 1:length(epocs)){
+  dataset<-datasetALL[epocs[i]] 
+  
+  ## Divide data into training (75%) and testing (25%). 
+  T<-nrow(dataset)
+  p=0.75
+  T_trn <- round(p*T)
+  trainindex <- 1:T_trn
+  ## Process class sets as data frames and scale the data 
+  # training = as.data.frame(dataset[trainindex,])
+  # testing = as.data.frame(dataset[-trainindex,])
+  
+  ## Exercise: Sometimes is necessary to scale data (substract mean, divide by std). 
+  ## Caveat: if want to get/plot actual predictions need to recover original scale 
+  ## re-do without scaling and observe if differences in results
+  training =  scale(as.data.frame(dataset[trainindex,]))
+  testing = scale(as.data.frame(dataset[-trainindex,]))
+  
+  rownames(training) = NULL
+  rownames(testing) = NULL
+  set.seed(.Random.seed)
+  
+  ################################
+  ##Fiting SVM, NNet and GP (To DO: tune parameters)
+  #---------------------------------------------------------------------------------------------#
+  #  SUPPORT VECTOR MACHINE --------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  ##svmTune (ToDO)
+  
+  svmFit <- svm(x=training[,-1],
+                  y=training[,1],
+                  type="eps-regression",
+                  kernel="radial",
+                  gamma=1e-03,
+                  cost=100
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  NEURAL NETWORK ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  # C = seq(0.2,1.8,0.2)
+  # size_vals=ceiling(ncol(training)*C)
+  # decay_vals=seq(0.1,1,0.1)
+  # nnetTune 
+  
+  nnetFit <- nnet(x=training[,-1],
+                    y=training[,1],
+                    skip=FALSE,
+                    maxit=10^4,
+                    trace=FALSE,
+                    linout=TRUE,
+                    size=16,
+                    decay=0.2
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  GAUSSIAN PROCESS ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  gpfit = gausspr(training[,-1], y=training[,1],
+                    type="regression",
+                    kernel="laplacedot",
+                    #kpar = list(sigma = 1.5), #list of kernel hyper-parameters 
+                    ## if you make it constant value then does not make mle estimation of sigma
+                    var = 0.002 # the initial noise variance: 0.001 default
+                    )
+  
+  #---------------------------------------------------------------------------------------------#
+  # PREDICTION ---------------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  predsvm  <- as.vector(predict(svmFit, testing[,-1]))
+  prednet <- as.vector(predict(nnetFit, testing[,-1], type="raw"))
+  predgp <- as.vector(predict(gpfit, testing[,-1]))
+  
+  actual <- testing[,1]
+  
+  ##predsvm = as.vector(predict(svmFit, testing[,-1],interval="prediction")) ##prediction interval does not seem to work on svm
+  ##prednet = as.vector(predict(nnetFit,testing[,-1],type="raw",interval="confidence")) ##"confidence" does not seem to work on nnet
+  #####################################
+  ##measure error prediction for all models
+  MSE.nn <- sum((prednet -actual)^2)/nrow(testing)
+  MSE.svm <- sum((predsvm-actual)^2)/nrow(testing)
+  MSE.gp <- sum((predgp -actual)^2)/nrow(testing)
+  
+  ###FURTHER EVALUATION
+  ##1. Evaluation for TARGET prediction. Residual sum of squares
+  ssr.nn=sum((prednet - actual)^2)
+  ssr.svm = sum((predsvm - actual)^2)
+  ssr.gp = sum((predgp - actual)^2)
+  ##Normalize Residual Mean Square Error (NRMSE) = ratio of performance against sample mean
+  ##if < 1 methods outperforms sample mean, ow forget it
+  nrmse.nn = sqrt(ssr.nn/((length(actual)-1)*var(actual)))
+  nrmse.svm = sqrt(ssr.svm/((length(actual)-1)*var(actual)))
+  nrmse.gp = sqrt(ssr.gp/((length(actual)-1)*var(actual)))
+  ##percentage of outperforming direct sample mean (sample expected value)
+  
+  resultstable$nrmse[i,] <- cbind(round(nrmse.nn,3), round(nrmse.svm,3),round(nrmse.gp,3))
+  
+} ##end-for
+
+
+bullishtable_HSBC <- resultstable
+
+#########################################
+#Construct same table, but now only for lags of target
+########################################
+# Define dataset
+
+feat = merge(na.trim(lag(target,1)),na.trim(lag(target,2)),na.trim(lag(target,3)),
+             all=FALSE)
+
+datasetALL = merge(target,feat,all=FALSE)
+colnames(datasetALL) = c("TARGET","lag.1", "lag.2", "lag.3")
+
+##Run Forecasting Backtesting
+resultstable <- list("nrmse"= table)
+
+## ANALYSIS  by epochs (1,2)
+## TO DO: parallelise 
+for(i in 1:length(epocs)){
+  dataset<-datasetALL[epocs[i]] 
+  
+  ## Divide data into training (75%) and testing (25%). 
+  T<-nrow(dataset)
+  p=0.75
+  T_trn <- round(p*T)
+  trainindex <- 1:T_trn
+  ## Process class sets as data frames and scale the data 
+  # training = as.data.frame(dataset[trainindex,])
+  # testing = as.data.frame(dataset[-trainindex,])
+  
+  ## Exercise: Sometimes is necessary to scale data (substract mean, divide by std). 
+  ## Caveat: if want to get/plot actual predictions need to recover original scale 
+  ## re-do without scaling and observe if differences in results
+  training =  scale(as.data.frame(dataset[trainindex,]))
+  testing = scale(as.data.frame(dataset[-trainindex,]))
+  
+  rownames(training) = NULL
+  rownames(testing) = NULL
+  set.seed(.Random.seed)
+  
+  ################################
+  ##Fiting SVM, NNet and GP (To DO: tune parameters)
+  #---------------------------------------------------------------------------------------------#
+  #  SUPPORT VECTOR MACHINE --------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  ##svmTune (ToDO)
+  
+  svmFit <- svm(x=training[,-1],
+                  y=training[,1],
+                  type="eps-regression",
+                  kernel="radial",
+                  gamma=1e-03,
+                  cost=100
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  NEURAL NETWORK ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  # C = seq(0.2,1.8,0.2)
+  # size_vals=ceiling(ncol(training)*C)
+  # decay_vals=seq(0.1,1,0.1)
+  # nnetTune 
+  
+  nnetFit <- nnet(x=training[,-1],
+                    y=training[,1],
+                    skip=FALSE,
+                    maxit=10^4,
+                    trace=FALSE,
+                    linout=TRUE,
+                    size=16,
+                    decay=0.2
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  GAUSSIAN PROCESS ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  gpfit = gausspr(training[,-1], y=training[,1],
+                    type="regression",
+                    kernel="laplacedot",
+                    #kpar = list(sigma = 1.5), #list of kernel hyper-parameters 
+                    ## if you make it constant value then does not make mle estimation of sigma
+                    var = 0.002 # the initial noise variance: 0.001 default
+                    )
+  
+  #---------------------------------------------------------------------------------------------#
+  # PREDICTION ---------------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  predsvm  <- as.vector(predict(svmFit, testing[,-1]))
+  prednet <- as.vector(predict(nnetFit, testing[,-1], type="raw"))
+  predgp <- as.vector(predict(gpfit, testing[,-1]))
+  
+  actual <- testing[,1]
+  
+  ##predsvm = as.vector(predict(svmFit, testing[,-1],interval="prediction")) ##prediction interval does not seem to work on svm
+  ##prednet = as.vector(predict(nnetFit,testing[,-1],type="raw",interval="confidence")) ##"confidence" does not seem to work on nnet
+  #####################################
+  ##measure error prediction for all models
+  MSE.nn <- sum((prednet -actual)^2)/nrow(testing)
+  MSE.svm <- sum((predsvm-actual)^2)/nrow(testing)
+  MSE.gp <- sum((predgp -actual)^2)/nrow(testing)
+  
+  ###FURTHER EVALUATION
+  ##1. Evaluation for TARGET prediction. Residual sum of squares
+  ssr.nn=sum((prednet - actual)^2)
+  ssr.svm = sum((predsvm - actual)^2)
+  ssr.gp = sum((predgp - actual)^2)
+  ##Normalize Residual Mean Square Error (NRMSE) = ratio of performance against sample mean
+  ##if < 1 methods outperforms sample mean, ow forget it
+  nrmse.nn = sqrt(ssr.nn/((length(actual)-1)*var(actual)))
+  nrmse.svm = sqrt(ssr.svm/((length(actual)-1)*var(actual)))
+  nrmse.gp = sqrt(ssr.gp/((length(actual)-1)*var(actual)))
+  ##percentage of outperforming direct sample mean (sample expected value)
+  
+  resultstable$nrmse[i,] <- cbind(round(nrmse.nn,3), round(nrmse.svm,3),round(nrmse.gp,3))
+  
+} ##end-for
+
+lagstable_HSBC <- resultstable
+
+lagstable_HSBC
+bearishtable_HSBC
+bullishtable_HSBC
+
+##Plot
+##recover the scale (sca) factor and center (cen) for targets
+sca <- attr(testing,'scaled:scale')["TARGET"]
+cen <- attr(testing,'scaled:center')["TARGET"]
+
+par(mar=c(2.5,2.5,2.5,2.5))
+plot(actual*sca+cen,t='l',col='gray20', ylab='', xlab ='',lty=3, main='Lags only - epoch 2 (for HSBC)', cex.main=0.75)
+lines(predsvm*sca+cen,t='l',col='blue',lwd=2)
+lines(prednet*sca+cen,col='tomato',lwd=2)
+lines(predgp*sca+cen,col='green',lwd=2)
+legend('bottomright',legend = c('target','SVM','NNet','GP'),col=c('gray20','blue','tomato','green'),lty=c(3,1,1,1),cex=.7)
+
+
+
+```
+
+
+#### For MSFT
+
+
+```{r, bearish variables MSFT}
+
+
+x <- read.csv('../homework_2/dataSent/MSFT.csv', sep = ",", header = TRUE)
+x<-x[,-1]
+##use Date as index
+data <- as.xts(zoo(as.matrix(x[,-1]), as.Date(as.character(x[,1]))))
+
+## Target :  Adj.Close Price 
+target <- data$Adj.Close
+
+
+## Analyse separately two different epochs
+epoc1<-'2018-01/2019-03'
+epoc2<-'2019-04/2020-05'
+epocs <- c(epoc1, epoc2)
+
+##List of tables for storing results
+table <- array(0, dim=c(2,3))
+rownames(table) <- c("epoc1", "epoc2")
+colnames(table) <- cbind("NNET", "SVM", "GP")
+
+
+
+
+# Define bearish set
+negativeP= na.omit(data$negativePartscr)
+uncertaintyP= na.omit(data$uncertaintyPartscr)
+findownP= na.omit(data$findownPartscr)
+
+bearish <- merge(na.trim(lag(negativeP,1)),na.trim(lag(negativeP,2)),na.trim(lag(negativeP,3)),
+                 na.trim(lag(uncertaintyP,1)),na.trim(lag(uncertaintyP,2)),na.trim(lag(uncertaintyP,3)),
+                 na.trim(lag(findownP,1)),na.trim(lag(findownP,2)),na.trim(lag(findownP,3)),
+                 all=FALSE)
+bearnames <- c("NegP.1","NegP.2","NegP.3",
+               "uncerP.1","uncerP.2","uncerP.3",
+               "findP.1","findP.2","findP.3")
+
+
+#Features: lags 1,2,3 of target with lags 1,2,3 of sentiments
+feat = merge(na.trim(lag(target,1)),na.trim(lag(target,2)),na.trim(lag(target,3)),
+            bearish,
+             #add other features here,
+            all=FALSE)
+
+datasetALL = merge(target,feat,all=FALSE)
+colnames(datasetALL) = c("TARGET",
+                         "lag.1", "lag.2", "lag.3",
+                         bearnames
+                         #names of other features
+                         )
+
+
+##Run Forecasting Backtesting
+resultstable <- list("nrmse"= table)
+
+## ANALYSIS  by epochs (1,2)
+## TO DO: parallelise 
+for(i in 1:length(epocs)){
+  dataset<-datasetALL[epocs[i]] 
+  
+  ## Divide data into training (75%) and testing (25%). 
+  T<-nrow(dataset)
+  p=0.75
+  T_trn <- round(p*T)
+  trainindex <- 1:T_trn
+  ## Process class sets as data frames and scale the data 
+  # training = as.data.frame(dataset[trainindex,])
+  # testing = as.data.frame(dataset[-trainindex,])
+  
+  ## Exercise: Sometimes is necessary to scale data (substract mean, divide by std). 
+  ## Caveat: if want to get/plot actual predictions need to recover original scale 
+  ## re-do without scaling and observe if differences in results
+  training =  scale(as.data.frame(dataset[trainindex,]))
+  testing = scale(as.data.frame(dataset[-trainindex,]))
+  
+  rownames(training) = NULL
+  rownames(testing) = NULL
+  set.seed(.Random.seed)
+  
+  ################################
+  ##Fiting SVM, NNet and GP (To DO: tune parameters)
+  #---------------------------------------------------------------------------------------------#
+  #  SUPPORT VECTOR MACHINE --------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  ##svmTune (ToDO)
+  
+  svmFit <- svm(x=training[,-1],
+                  y=training[,1],
+                  type="eps-regression",
+                  kernel="radial",
+                  gamma=1e-03,
+                  cost=100
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  NEURAL NETWORK ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  # C = seq(0.2,1.8,0.2)
+  # size_vals=ceiling(ncol(training)*C)
+  # decay_vals=seq(0.1,1,0.1)
+  # nnetTune 
+  
+  nnetFit <- nnet(x=training[,-1],
+                    y=training[,1],
+                    skip=FALSE,
+                    maxit=10^4,
+                    trace=FALSE,
+                    linout=TRUE,
+                    size=16,
+                    decay=0.2
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  GAUSSIAN PROCESS ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  gpfit = gausspr(training[,-1], y=training[,1],
+                    type="regression",
+                    kernel="laplacedot",
+                    #kpar = list(sigma = 1.5), #list of kernel hyper-parameters 
+                    ## if you make it constant value then does not make mle estimation of sigma
+                    var = 0.002 # the initial noise variance: 0.001 default
+                    )
+  
+  #---------------------------------------------------------------------------------------------#
+  # PREDICTION ---------------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  predsvm  <- as.vector(predict(svmFit, testing[,-1]))
+  prednet <- as.vector(predict(nnetFit, testing[,-1], type="raw"))
+  predgp <- as.vector(predict(gpfit, testing[,-1]))
+  
+  actual <- testing[,1]
+  
+  ##predsvm = as.vector(predict(svmFit, testing[,-1],interval="prediction")) ##prediction interval does not seem to work on svm
+  ##prednet = as.vector(predict(nnetFit,testing[,-1],type="raw",interval="confidence")) ##"confidence" does not seem to work on nnet
+  #####################################
+  ##measure error prediction for all models
+  MSE.nn <- sum((prednet -actual)^2)/nrow(testing)
+  MSE.svm <- sum((predsvm-actual)^2)/nrow(testing)
+  MSE.gp <- sum((predgp -actual)^2)/nrow(testing)
+  
+  ###FURTHER EVALUATION
+  ##1. Evaluation for TARGET prediction. Residual sum of squares
+  ssr.nn=sum((prednet - actual)^2)
+  ssr.svm = sum((predsvm - actual)^2)
+  ssr.gp = sum((predgp - actual)^2)
+  ##Normalize Residual Mean Square Error (NRMSE) = ratio of performance against sample mean
+  ##if < 1 methods outperforms sample mean, ow forget it
+  nrmse.nn = sqrt(ssr.nn/((length(actual)-1)*var(actual)))
+  nrmse.svm = sqrt(ssr.svm/((length(actual)-1)*var(actual)))
+  nrmse.gp = sqrt(ssr.gp/((length(actual)-1)*var(actual)))
+  ##percentage of outperforming direct sample mean (sample expected value)
+  
+  resultstable$nrmse[i,] <- cbind(round(nrmse.nn,3), round(nrmse.svm,3),round(nrmse.gp,3))
+  
+} ##end-for
+
+##Print results of all epochs for bearish features
+bearishtable_MSFT <-resultstable
+
+##Plot predictions (of last epoch) against actual values
+##WARNING: If you've scaled data you must recover back original series
+attributes(testing)
+##recover the scale (sca) factor and center (cen) for targets
+sca <- attr(testing,'scaled:scale')["TARGET"]
+cen <- attr(testing,'scaled:center')["TARGET"]
+
+# par( mfrow = c( 1, 2 ) ) #this to put in different adjacent boxes
+# par(mar=c(2.5,2.5,2.5,2.5)) 
+plot(actual*sca+cen,t='l',col='gray20', ylab='', xlab ='',lty=3, main='Lags $ Bearish - epoch 1 (for MSFT)', cex.main=0.75)
+lines(predsvm*sca+cen,t='l',col='blue',lwd=2)
+lines(prednet*sca+cen,col='tomato',lwd=2)
+lines(predgp*sca+cen,col='green',lwd=2)
+legend('bottomright',legend = c('target','SVM','NNet','GP'),col=c('gray20','blue','tomato','green'),lty=c(3,1,1,1),cex=.7)
+
+
+
+
+```
+
+```{r, bullish variables MSFT}
+## Bullish variables
+
+
+positiveP= na.omit(data$positivePartscr)
+certaintyP= na.omit(data$certaintyPartscr)
+finupP= na.omit(data$finupPartscr)
+
+bullish <- merge(na.trim(lag(positiveP,1)),na.trim(lag(positiveP,2)),na.trim(lag(positiveP,3)),
+                 na.trim(lag(certaintyP,1)),na.trim(lag(certaintyP,2)),na.trim(lag(certaintyP,3)),
+                 na.trim(lag(finupP,1)),na.trim(lag(finupP,2)),na.trim(lag(finupP,3)),
+                 all=FALSE)
+bullishnames <- c("PosP.1","PosP.2","PosP.3",
+                  "cerP.1","cerP.2","cerP.3",
+                  "findPp.1","findPp.2","findPp.3")
+
+# Add lags of target and target itself
+
+feat = merge(na.trim(lag(target,1)),na.trim(lag(target,2)),na.trim(lag(target,3)),
+             bullish,
+             #bullishP,
+             #add other features here,
+             all=FALSE)
+
+datasetALL = merge(target,feat,all=FALSE)
+colnames(datasetALL) = c("TARGET",
+                         "lag.1", "lag.2", "lag.3",
+                         bullishnames
+                         #names of other features
+                          )
+
+##Run Forecasting Backtesting (Go to line 109)
+
+##Run Forecasting Backtesting
+resultstable <- list("nrmse"= table)
+
+## ANALYSIS  by epochs (1,2)
+## TO DO: parallelise 
+for(i in 1:length(epocs)){
+  dataset<-datasetALL[epocs[i]] 
+  
+  ## Divide data into training (75%) and testing (25%). 
+  T<-nrow(dataset)
+  p=0.75
+  T_trn <- round(p*T)
+  trainindex <- 1:T_trn
+  ## Process class sets as data frames and scale the data 
+  # training = as.data.frame(dataset[trainindex,])
+  # testing = as.data.frame(dataset[-trainindex,])
+  
+  ## Exercise: Sometimes is necessary to scale data (substract mean, divide by std). 
+  ## Caveat: if want to get/plot actual predictions need to recover original scale 
+  ## re-do without scaling and observe if differences in results
+  training =  scale(as.data.frame(dataset[trainindex,]))
+  testing = scale(as.data.frame(dataset[-trainindex,]))
+  
+  rownames(training) = NULL
+  rownames(testing) = NULL
+  set.seed(.Random.seed)
+  
+  ################################
+  ##Fiting SVM, NNet and GP (To DO: tune parameters)
+  #---------------------------------------------------------------------------------------------#
+  #  SUPPORT VECTOR MACHINE --------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  ##svmTune (ToDO)
+  
+  svmFit <- svm(x=training[,-1],
+                  y=training[,1],
+                  type="eps-regression",
+                  kernel="radial",
+                  gamma=1e-03,
+                  cost=100
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  NEURAL NETWORK ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  # C = seq(0.2,1.8,0.2)
+  # size_vals=ceiling(ncol(training)*C)
+  # decay_vals=seq(0.1,1,0.1)
+  # nnetTune 
+  
+  nnetFit <- nnet(x=training[,-1],
+                    y=training[,1],
+                    skip=FALSE,
+                    maxit=10^4,
+                    trace=FALSE,
+                    linout=TRUE,
+                    size=16,
+                    decay=0.2
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  GAUSSIAN PROCESS ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  gpfit = gausspr(training[,-1], y=training[,1],
+                    type="regression",
+                    kernel="laplacedot",
+                    #kpar = list(sigma = 1.5), #list of kernel hyper-parameters 
+                    ## if you make it constant value then does not make mle estimation of sigma
+                    var = 0.002 # the initial noise variance: 0.001 default
+                    )
+  
+  #---------------------------------------------------------------------------------------------#
+  # PREDICTION ---------------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  predsvm  <- as.vector(predict(svmFit, testing[,-1]))
+  prednet <- as.vector(predict(nnetFit, testing[,-1], type="raw"))
+  predgp <- as.vector(predict(gpfit, testing[,-1]))
+  
+  actual <- testing[,1]
+  
+  ##predsvm = as.vector(predict(svmFit, testing[,-1],interval="prediction")) ##prediction interval does not seem to work on svm
+  ##prednet = as.vector(predict(nnetFit,testing[,-1],type="raw",interval="confidence")) ##"confidence" does not seem to work on nnet
+  #####################################
+  ##measure error prediction for all models
+  MSE.nn <- sum((prednet -actual)^2)/nrow(testing)
+  MSE.svm <- sum((predsvm-actual)^2)/nrow(testing)
+  MSE.gp <- sum((predgp -actual)^2)/nrow(testing)
+  
+  ###FURTHER EVALUATION
+  ##1. Evaluation for TARGET prediction. Residual sum of squares
+  ssr.nn=sum((prednet - actual)^2)
+  ssr.svm = sum((predsvm - actual)^2)
+  ssr.gp = sum((predgp - actual)^2)
+  ##Normalize Residual Mean Square Error (NRMSE) = ratio of performance against sample mean
+  ##if < 1 methods outperforms sample mean, ow forget it
+  nrmse.nn = sqrt(ssr.nn/((length(actual)-1)*var(actual)))
+  nrmse.svm = sqrt(ssr.svm/((length(actual)-1)*var(actual)))
+  nrmse.gp = sqrt(ssr.gp/((length(actual)-1)*var(actual)))
+  ##percentage of outperforming direct sample mean (sample expected value)
+  
+  resultstable$nrmse[i,] <- cbind(round(nrmse.nn,3), round(nrmse.svm,3),round(nrmse.gp,3))
+  
+} ##end-for
+
+
+bullishtable_MSFT <- resultstable
+
+#########################################
+#Construct same table, but now only for lags of target
+########################################
+# Define dataset
+
+feat = merge(na.trim(lag(target,1)),na.trim(lag(target,2)),na.trim(lag(target,3)),
+             all=FALSE)
+
+datasetALL = merge(target,feat,all=FALSE)
+colnames(datasetALL) = c("TARGET","lag.1", "lag.2", "lag.3")
+
+##Run Forecasting Backtesting
+resultstable <- list("nrmse"= table)
+
+## ANALYSIS  by epochs (1,2)
+## TO DO: parallelise 
+for(i in 1:length(epocs)){
+  dataset<-datasetALL[epocs[i]] 
+  
+  ## Divide data into training (75%) and testing (25%). 
+  T<-nrow(dataset)
+  p=0.75
+  T_trn <- round(p*T)
+  trainindex <- 1:T_trn
+  ## Process class sets as data frames and scale the data 
+  # training = as.data.frame(dataset[trainindex,])
+  # testing = as.data.frame(dataset[-trainindex,])
+  
+  ## Exercise: Sometimes is necessary to scale data (substract mean, divide by std). 
+  ## Caveat: if want to get/plot actual predictions need to recover original scale 
+  ## re-do without scaling and observe if differences in results
+  training =  scale(as.data.frame(dataset[trainindex,]))
+  testing = scale(as.data.frame(dataset[-trainindex,]))
+  
+  rownames(training) = NULL
+  rownames(testing) = NULL
+  set.seed(.Random.seed)
+  
+  ################################
+  ##Fiting SVM, NNet and GP (To DO: tune parameters)
+  #---------------------------------------------------------------------------------------------#
+  #  SUPPORT VECTOR MACHINE --------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  ##svmTune (ToDO)
+  
+  svmFit <- svm(x=training[,-1],
+                  y=training[,1],
+                  type="eps-regression",
+                  kernel="radial",
+                  gamma=1e-03,
+                  cost=100
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  NEURAL NETWORK ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  # C = seq(0.2,1.8,0.2)
+  # size_vals=ceiling(ncol(training)*C)
+  # decay_vals=seq(0.1,1,0.1)
+  # nnetTune 
+  
+  nnetFit <- nnet(x=training[,-1],
+                    y=training[,1],
+                    skip=FALSE,
+                    maxit=10^4,
+                    trace=FALSE,
+                    linout=TRUE,
+                    size=16,
+                    decay=0.2
+                  )
+  
+  #---------------------------------------------------------------------------------------------#
+  #  GAUSSIAN PROCESS ----------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  gpfit = gausspr(training[,-1], y=training[,1],
+                    type="regression",
+                    kernel="laplacedot",
+                    #kpar = list(sigma = 1.5), #list of kernel hyper-parameters 
+                    ## if you make it constant value then does not make mle estimation of sigma
+                    var = 0.002 # the initial noise variance: 0.001 default
+                    )
+  
+  #---------------------------------------------------------------------------------------------#
+  # PREDICTION ---------------------------------------------------------------------------------#
+  #---------------------------------------------------------------------------------------------#
+  predsvm  <- as.vector(predict(svmFit, testing[,-1]))
+  prednet <- as.vector(predict(nnetFit, testing[,-1], type="raw"))
+  predgp <- as.vector(predict(gpfit, testing[,-1]))
+  
+  actual <- testing[,1]
+  
+  ##predsvm = as.vector(predict(svmFit, testing[,-1],interval="prediction")) ##prediction interval does not seem to work on svm
+  ##prednet = as.vector(predict(nnetFit,testing[,-1],type="raw",interval="confidence")) ##"confidence" does not seem to work on nnet
+  #####################################
+  ##measure error prediction for all models
+  MSE.nn <- sum((prednet -actual)^2)/nrow(testing)
+  MSE.svm <- sum((predsvm-actual)^2)/nrow(testing)
+  MSE.gp <- sum((predgp -actual)^2)/nrow(testing)
+  
+  ###FURTHER EVALUATION
+  ##1. Evaluation for TARGET prediction. Residual sum of squares
+  ssr.nn=sum((prednet - actual)^2)
+  ssr.svm = sum((predsvm - actual)^2)
+  ssr.gp = sum((predgp - actual)^2)
+  ##Normalize Residual Mean Square Error (NRMSE) = ratio of performance against sample mean
+  ##if < 1 methods outperforms sample mean, ow forget it
+  nrmse.nn = sqrt(ssr.nn/((length(actual)-1)*var(actual)))
+  nrmse.svm = sqrt(ssr.svm/((length(actual)-1)*var(actual)))
+  nrmse.gp = sqrt(ssr.gp/((length(actual)-1)*var(actual)))
+  ##percentage of outperforming direct sample mean (sample expected value)
+  
+  resultstable$nrmse[i,] <- cbind(round(nrmse.nn,3), round(nrmse.svm,3),round(nrmse.gp,3))
+  
+} ##end-for
+
+lagstable_MSFT <- resultstable
+
+lagstable_MSFT
+bearishtable_MSFT
+bullishtable_MSFT
+
+##Plot
+##recover the scale (sca) factor and center (cen) for targets
+sca <- attr(testing,'scaled:scale')["TARGET"]
+cen <- attr(testing,'scaled:center')["TARGET"]
+
+par(mar=c(2.5,2.5,2.5,2.5))
+plot(actual*sca+cen,t='l',col='gray20', ylab='', xlab ='',lty=3, main='Lags only - epoch 2 (for MSFT)', cex.main=0.75)
+lines(predsvm*sca+cen,t='l',col='blue',lwd=2)
+lines(prednet*sca+cen,col='tomato',lwd=2)
+lines(predgp*sca+cen,col='green',lwd=2)
+legend('bottomright',legend = c('target','SVM','NNet','GP'),col=c('gray20','blue','tomato','green'),lty=c(3,1,1,1),cex=.7)
+
+
+
+```
+
+```{r}
+
+lagstable_HSBC$nrmse
+bearishtable_HSBC$nrmse
+bullishtable_HSBC$nrmse
+
+```
+
+```{r}
+
+lagstable_MSFT$nrmse
+bearishtable_MSFT$nrmse
+bullishtable_MSFT$nrmse
+
+```
+
+
+
+
+
+# Question 2
+
+Preparation before data
+
+```{r,include=FALSE, warning=FALSE}
+fileloc <- dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(fileloc)
+rm(fileloc)
+set.seed(123)
+
+library(fBasics)
+library(data.table)
+library(xts)
+library(zoo)
+library(quantmod)
+library(PerformanceAnalytics)
+library(PortfolioAnalytics)
+library(GenSA)
+library(timeSeries)
+library(fPortfolio)
+library(quantmod)
+library(plyr)
+library(ROI)
+library(GenSA)
+library(DEoptim)
+library(xtable)
+library(ROI.plugin.glpk)
+library(ROI.plugin.quadprog)
+library(portfolioBacktest)
+library(ggplot2)
+library(mvtnorm)
+library(CVXR)
+library(gridExtra)
+
+```
+
+Data cleaning and preparation
+
+```{r, echo=FALSE, warning=FALSE}
+
+data <- readRDS("dataset.rds")
+data_adj <-data[["adjusted"]]
+data_PNlog <- data[["PNlog"]]
+fama_data <- read.csv("F-F_Research_Data_Factors_daily.CSV", skip = 4) #to skip the first 4 lines
+fama_data <- fama_data[-nrow(fama_data), ]
+
+fama <- xts(x = fama_data[, c(2,3,4)], order.by = as.Date(paste(fama_data[, 1]), "%Y%m%d"))
+
+#now we want to calculate the rate of missing
+c_missing_rate <- function(data) {
+  
+  missing_rate <- function(x) {
+    sum(is.na(x)) / length(x)
+  }
+  
+  years <- format(index(data), "%Y")
+  
+  missing_value <- lapply(split(data, years), function(x) {
+    apply(x, 2, missing_rate)
+  })
+  
+  missing_v_data<- do.call(rbind, missing_value)
+  
+  return(missing_v_data)
+}
+
+missing_value_PNlog <- c_missing_rate(data_PNlog)
+
+
+
+begin_date <- "2015-01-02"
+end_date <- "2016-12-31"
+
+period <- paste(begin_date,"/",end_date,sep="")
+stocks <- c("AAPL","AMZN","DB","DIS","FB","GOOG","PFE","JPM","MSFT")
+
+selected_adj <- data_adj[period, stocks]
+selected_PNlog <- data_PNlog[period, stocks]
+
+X <- diff(log(selected_adj), na.pad = FALSE)
+N <- ncol(X)
+T <- nrow(X)
+
+F_FFrench <- fama[index(X)]/100
+
+PNlog_Mkt <- apply(selected_PNlog, 1, function(x) mean(x, na.rm = TRUE))
+PNlog_Mkt <- na.fill(as.xts(PNlog_Mkt, order.by=index(selected_PNlog)), "extend")
+
+Sent_indicator <- PNlog_Mkt[index(X)]
+
+```
+
+Calculating Sigma and mu for FF3 and Sent_indicator
+
+```{r, echo=FALSE, warning=FALSE}
+
+# FF 3 factor model
+F_ <- cbind(ones = 1, F_FFrench)
+
+gamma <- t(solve(t(F_) %*% F_, t(F_) %*% X))
+
+colnames(gamma) <- c("alpha", "beta1", "beta2", "beta3")
+
+alpha <- gamma[, 1]
+B <- gamma[, 2:4]
+E <- xts(t(t(X) - gamma %*% t(F_)), index(X))
+mu_FF3 <- colMeans(xts(t(gamma %*% t(F_)),index(X)))
+PsiFF <- (1/(T-4)) * t(E) %*% E
+Sigma_FamaFrench <- B %*% cov(F_FFrench) %*% t(B) + diag(diag(PsiFF))
+
+# 1 factor model Sent_indicator
+F_ <- cbind(ones = 1, Sent_indicator)
+gamma <- t(solve(t(F_) %*% F_, t(F_) %*% X))
+colnames(gamma) <- c("alpha", "beta")
+alpha <- gamma[, 1]
+beta <- gamma[, 2]
+E <- xts(t(t(X) - gamma %*% t(F_)), index(X))
+mu_Sent <- colMeans(xts(t(gamma %*% t(F_)),index(X)))
+Psi_Sent <- (1/(T-2)) * t(E) %*% E
+Sigma_Sent_indicator <- as.numeric(var(Sent_indicator)) * beta %o% beta + diag(diag(Psi_Sent))
+
+mu <- colMeans(X)
+Sigma <- cov(X)
+
+
+
+# Ensure necessary packages are installed and loaded
+if (!require(gridExtra)) {
+  install.packages("gridExtra")
+}
+library(gridExtra)
+
+if (!require(grid)) {
+  install.packages("grid")
+}
+library(grid)
+
+# Create directory if it doesn't exist
+if (!dir.exists("Sigmastable")) {
+  dir.create("Sigmastable")
+}
+
+# Create table and save as PDF with custom font
+table_Sigma_FamaFrench <- tableGrob(round(Sigma_FamaFrench, 6), theme = ttheme_default(core = list(fg_params = list(fontfamily = "sans", fontsize = 10))))
+ggsave(filename = "Sigmastable/Sigma_FamaFrench.pdf", plot = ggplot() + annotation_custom(grob = table_Sigma_FamaFrench), device = "pdf", width = 9, height = 4)
+
+table_Sigma_SentInx <- tableGrob(round(Sigma_Sent_indicator, 8), theme = ttheme_default(core = list(fg_params = list(fontfamily = "sans", fontsize = 10))))
+ggsave(filename = "Sigmastable/Sigma_SentInx.pdf", plot = ggplot() + annotation_custom(grob = table_Sigma_SentInx), device = "pdf", width = 11, height = 4)
+
+# Print perturbation matrices
+print("Perturbation matrix for Fama-French 3-factors model")
+print(Sigma_FamaFrench)
+
+print("Perturbation matrix for Sentiment Indicator PNlog Factor Model")
+print(Sigma_Sent_indicator)
+
+
+
+
+
+
+#The Robust (ellipsoid) Global Maximum Return Portfolio
+
+# function for the Robust Global Maximum Return Portfolio
+portfolioMaxReturnRobustEllipsoid <- function(mu_hat, S, kappa) {
+  
+  S12 <- chol(S)
+  
+  w <- Variable(length(mu_hat))
+  
+  prob <- Problem(Maximize( t(w) %*% mu_hat - kappa * p_norm(S12 %*% w,p=2) ), 
+                  constraints = list(w >= 0, sum(w) == 1))
+  result <- solve(prob)
+  
+  return(as.vector(result$getValue(w)))
+}
+
+
+
+# Ensure necessary packages are installed and loaded
+if (!require(gridExtra)) {
+  install.packages("gridExtra")
+}
+library(gridExtra)
+
+# Create directory if it doesn't exist
+if (!dir.exists("Sigmatable")) {
+  dir.create("Sigmatable")
+}
+
+
+# Create custom theme with all backgrounds white, text in black and bold for row names and column headers
+custom_theme <- ttheme_default(
+  core = list(fg_params = list(fontface = "plain", fontsize = 9, col = "black"), 
+              bg_params = list(fill = "white", col = "black")),
+  colhead = list(fg_params = list(fontface = "bold", fontsize = 10, col = "black"), 
+                 bg_params = list(fill = "white", col = "black")),
+  rowhead = list(fg_params = list(fontface = "bold", fontsize = 10, col = "black"), 
+                 bg_params = list(fill = "white", col = "black"))
+)
+
+# Create table for Sigma_FamaFrench and save as PNG
+table_Sigma_FamaFrench <- tableGrob(format(Sigma_FamaFrench, digits = 6), theme = custom_theme)
+ggsave(
+  filename = "Sigmatable/Sigma_FamaFrench.png", 
+  plot = ggplot() + theme_void() + annotation_custom(grob = table_Sigma_FamaFrench), 
+  device = "png", 
+  width = 9, 
+  height = 4
+)
+
+# Create table for Sigma_Sent_indicator and save as PNG
+table_Sigma_SentInx <- tableGrob(format(Sigma_Sent_indicator, digits = 6), theme = custom_theme) # digits changed to 6
+ggsave(
+  filename = "Sigmatable/Sigma_Sent_indicator.png", 
+  plot = ggplot() + theme_void() + annotation_custom(grob = table_Sigma_SentInx), 
+  device = "png", 
+  width = 9, 
+  height = 4
+)
+
+
+
+kappa <- c(0.1,0.33,0.66,0.9)
+```
+
+
+
+Sensitivity Analysis  FF 3 factors model
+
+```{r, echo=FALSE, warning=FALSE}
+
+FF_all_GMRP_r_ellipsoid <- list()
+
+
+dir_n <- "Fama_French_3"
+if (!dir.exists(dir_n)) {
+  dir.create(dir_n)
+}
+
+
+for (j in seq(1:4)) {
+w_GMRP <- portfolioMaxReturnRobustEllipsoid(mu_FF3,Sigma_FamaFrench,kappa[j])
+names(w_GMRP) <- colnames(X)
+w_tot_GMRP <- cbind(w_GMRP)
+
+
+  pdf(file=paste0(dir_n, "/FF3_GMRP_allocation_k=", kappa[j], ".pdf"), width=7, height=5)
+  barplot(t(w_GMRP), col = "red", legend = colnames(X), beside = TRUE,
+          main = paste("Robust (ellipsoid) Global Maximum Return Portfolio allocation, k=",kappa[j]),
+          xlab = "stocks", ylab = "dollars")
+  dev.off()
+
+
+# Inside your loop
+barplot(t(w_GMRP), col = rainbow(length(w_GMRP)), 
+        legend = colnames(X), beside = TRUE,
+        main = paste("Robust (ellipsoid) Global Maximum Return Portfolio allocation, k=",kappa[j]),
+        xlab = "stocks", ylab = "dollars")
+
+
+  
+  
+# Sensitivity Test
+  for (i in 1:6) {
+    X_noisy <- rmvnorm(n = T, mean = mu_FF3, sigma = Sigma_FamaFrench)
+    mu_noisy <- colMeans(X_noisy)
+    Sigma_noisy <- cov(X_noisy)
+    
+    w_GMRP_noise <- portfolioMaxReturnRobustEllipsoid(mu_noisy, Sigma_noisy, kappa[j])
+    w_tot_GMRP <- cbind(w_tot_GMRP, w_GMRP_noise)
+    
+  }
+
+FF_all_GMRP_r_ellipsoid[[paste0("kappa_", kappa[j])]] <- w_tot_GMRP
+
+
+pdf(file=paste0(dir_n, "/FF3_GMRP_allocation_comparison_k=", kappa[j], ".pdf"), width=7, height=5)
+  barplot(t(w_tot_GMRP), col = 1:7, #legend = colnames(w_all_GMRP_robust_ellipsoid), 
+          beside = TRUE, args.legend = list(bg = "white"),
+          main = paste("Robust (ellipsoid) Global Maximum Return Portfolio allocation, k=",kappa[j]), xlab = "stocks", ylab = "dollars")
+  dev.off()
+
+
+pdf(file=paste0(dir_n, "/FF3_GMRP_allocation_stacked_k=", kappa[j], ".pdf"), width=7, height=5)
+  chart.StackedBar(t(w_tot_GMRP), 
+                   main = paste("Robust (ellipsoid) Global Maximum Return Portfolio allocation, k=",kappa[j]), 
+                   ylab = "w", space = 0, border = NA)
+  dev.off()
+}
+
+
+
+```
+
+```{r, echo=FALSE, warning=FALSE}
+Sent_tot_GMRP <- list()
+
+dir_n <- "Sentiment_PNlog"
+if (!dir.exists(dir_n)) {
+  dir.create(dir_n)
+}
+
+for (j in seq(1:4)) {
+w_GMRP <- portfolioMaxReturnRobustEllipsoid(mu_Sent,Sigma_SentInx,kappa[j])
+names(w_GMRP) <- colnames(X)
+w_tot_GMRP <- cbind(w_GMRP)
+
+pdf(file=paste0(dir_name, "/Sent_GMRP_allocation_k=", kappa[j], ".pdf"), width=7, height=5)
+  barplot(t(w_GMRP), col = "red", legend = colnames(X), beside = TRUE,
+          main = paste("Robust (ellipsoid) Global Maximum Return Portfolio allocation, k=",kappa[j]),
+          xlab = "stocks", ylab = "dollars")
+  dev.off()
+
+# Sensitivity Test
+  for (i in 1:6) {
+    X_noisy <- rmvnorm(n = T, mean = mu_Sent, sigma = Sigma_SentInx)
+    mu_noisy <- colMeans(X_noisy)
+    Sigma_noisy <- cov(X_noisy)
+    
+    w_GMRP_noise<- portfolioMaxReturnRobustEllipsoid(mu_noisy, Sigma_noisy, kappa[j])
+    w_tot_GMRP <- cbind(w_tot_GMRP, w_GMRP_noise)
+    
+  }
+
+Sent_tot_GMRP[[paste0("kappa_", kappa[j])]] <- w_tot_GMRP
+
+
+
+pdf(file=paste0(dir_name, "/Sent_GMRP_allocation_comparison_k=", kappa[j], ".pdf"), width=7, height=5)
+  barplot(t(w_tot_GMRP), col = 1:7, #legend = colnames(w_all_GMRP_robust_ellipsoid), 
+          beside = TRUE, args.legend = list(bg = "white"),
+          main = paste("Robust (ellipsoid) Global Maximum Return Portfolio allocation, k=",kappa[j]), xlab = "stocks", ylab = "dollars")
+  dev.off()
+
+
+pdf(file=paste0(dir_name, "/Sent_GMRP_allocation_stacked_k=", kappa[j], ".pdf"), width=7, height=5)
+  chart.StackedBar(t(w_tot_GMRP), 
+                   main = paste("Robust (ellipsoid) Global Maximum Return Portfolio allocation, k=",kappa[j]), 
+                   ylab = "weights", space = 0, border = NA)
+  dev.off()
+}
+
+
+
+
+
+```
